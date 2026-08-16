@@ -32,6 +32,66 @@ extern SRD_PRIV GSList *sessions;
 
 /** @endcond */
 
+static void channel_extraction_data_rebuild(struct srd_decoder_inst *di)
+{
+	int byte_offset, i;
+	uint8_t bit_mask, pin;
+
+	if (!di || !di->dec_channelmap)
+		return;
+
+	if (!di->channel_byte_offsets)
+		di->channel_byte_offsets = g_array_sized_new(FALSE, FALSE,
+				sizeof(int), di->dec_num_channels);
+	if (!di->channel_bit_masks)
+		di->channel_bit_masks = g_array_sized_new(FALSE, FALSE,
+				sizeof(uint8_t), di->dec_num_channels);
+	if (!di->current_pins_array)
+		di->current_pins_array = g_array_sized_new(FALSE, FALSE,
+				sizeof(uint8_t), di->dec_num_channels);
+	if (!di->mapped_channels)
+		di->mapped_channels = g_array_sized_new(FALSE, FALSE,
+				sizeof(int), di->dec_num_channels);
+
+	g_array_set_size(di->channel_byte_offsets, di->dec_num_channels);
+	g_array_set_size(di->channel_bit_masks, di->dec_num_channels);
+	g_array_set_size(di->current_pins_array, di->dec_num_channels);
+	g_array_set_size(di->mapped_channels, 0);
+	for (i = 0; i < di->dec_num_channels; i++) {
+		if (di->dec_channelmap[i] == -1) {
+			byte_offset = 0;
+			bit_mask = 0;
+			pin = 0xff;
+		} else {
+			byte_offset = di->dec_channelmap[i] / 8;
+			bit_mask = 1U << (di->dec_channelmap[i] % 8);
+			pin = 0;
+			g_array_append_val(di->mapped_channels, i);
+		}
+		g_array_index(di->channel_byte_offsets, int, i) = byte_offset;
+		g_array_index(di->channel_bit_masks, uint8_t, i) = bit_mask;
+		g_array_index(di->current_pins_array, uint8_t, i) = pin;
+	}
+	di->all_channels_mapped =
+			di->mapped_channels->len == (guint)di->dec_num_channels;
+}
+
+static void matching_working_storage_free(struct srd_decoder_inst *di)
+{
+	if (!di)
+		return;
+
+	g_clear_pointer(&di->match_array, g_array_unref);
+	g_clear_pointer(&di->compiled_conditions, g_array_unref);
+	g_clear_pointer(&di->compiled_terms, g_array_unref);
+	g_clear_pointer(&di->channel_byte_offsets, g_array_unref);
+	g_clear_pointer(&di->channel_bit_masks, g_array_unref);
+	g_clear_pointer(&di->current_pins_array, g_array_unref);
+	g_clear_pointer(&di->mapped_channels, g_array_unref);
+	di->all_channels_mapped = FALSE;
+	di->conditions_compiled = FALSE;
+}
+
 /**
  * @file
  *
@@ -315,6 +375,7 @@ SRD_API int srd_inst_channel_set_all(struct srd_decoder_inst *di,
 
 	g_free(di->dec_channelmap);
 	di->dec_channelmap = new_channelmap;
+	channel_extraction_data_rebuild(di);
 
 	return SRD_OK;
 }
@@ -384,6 +445,7 @@ SRD_API struct srd_decoder_inst *srd_inst_new(struct srd_session *sess,
 				g_malloc(sizeof(int) * di->dec_num_channels);
 		for (i = 0; i < di->dec_num_channels; i++)
 			di->dec_channelmap[i] = i;
+		channel_extraction_data_rebuild(di);
 		/*
 		 * Will be used to prepare a sample at every iteration
 		 * of the instance's decode() method.
@@ -402,6 +464,8 @@ SRD_API struct srd_decoder_inst *srd_inst_new(struct srd_session *sess,
 			srd_exception_catch("Failed to create %s instance",
 					decoder_id);
 		PyGILState_Release(gstate);
+		oldpins_array_free(di);
+		matching_working_storage_free(di);
 		g_free(di->dec_channelmap);
 		g_free(di);
 		return NULL;
@@ -410,6 +474,8 @@ SRD_API struct srd_decoder_inst *srd_inst_new(struct srd_session *sess,
 	PyGILState_Release(gstate);
 
 	if (options && srd_inst_option_set(di, options) != SRD_OK) {
+		oldpins_array_free(di);
+		matching_working_storage_free(di);
 		g_free(di->dec_channelmap);
 		g_free(di);
 		return NULL;
@@ -785,8 +851,7 @@ SRD_PRIV void match_array_free(struct srd_decoder_inst *di)
 	if (!di || !di->match_array)
 		return;
 
-	g_array_free(di->match_array, TRUE);
-	di->match_array = NULL;
+	g_array_set_size(di->match_array, 0);
 }
 
 /** @private */
@@ -805,172 +870,227 @@ SRD_PRIV void condition_list_free(struct srd_decoder_inst *di)
 
 	g_slist_free(di->condition_list);
 	di->condition_list = NULL;
+	di->conditions_compiled = FALSE;
+	if (di->compiled_conditions)
+		g_array_set_size(di->compiled_conditions, 0);
+	if (di->compiled_terms)
+		g_array_set_size(di->compiled_terms, 0);
+	match_array_free(di);
 }
 
-static gboolean have_non_null_conds(const struct srd_decoder_inst *di)
+static gboolean compile_conditions(struct srd_decoder_inst *di)
 {
-	GSList *l, *cond;
+	GSList *l, *ll;
+	struct srd_compiled_condition compiled_cond;
+	struct srd_term compiled_term, *term;
+	gboolean have_terms;
+	guint num_conditions;
 
-	if (!di)
-		return FALSE;
+	if (!di->compiled_conditions)
+		di->compiled_conditions = g_array_new(FALSE, FALSE,
+				sizeof(struct srd_compiled_condition));
+	if (!di->compiled_terms)
+		di->compiled_terms = g_array_new(FALSE, FALSE,
+				sizeof(struct srd_term));
+	g_array_set_size(di->compiled_conditions, 0);
+	g_array_set_size(di->compiled_terms, 0);
+	have_terms = FALSE;
 
 	for (l = di->condition_list; l; l = l->next) {
-		cond = l->data;
-		if (cond)
-			return TRUE;
+		compiled_cond.first_term = di->compiled_terms->len;
+		compiled_cond.num_terms = 0;
+		for (ll = l->data; ll; ll = ll->next) {
+			term = ll->data;
+			compiled_term = *term;
+			if (compiled_term.type != SRD_TERM_SKIP &&
+					compiled_term.type != SRD_TERM_ALWAYS_FALSE &&
+					di->dec_channelmap[compiled_term.channel] == -1)
+				compiled_term.type = SRD_TERM_ALWAYS_FALSE;
+			g_array_append_val(di->compiled_terms, compiled_term);
+			compiled_cond.num_terms++;
+			have_terms = TRUE;
+		}
+		g_array_append_val(di->compiled_conditions, compiled_cond);
 	}
 
-	return FALSE;
+	num_conditions = di->compiled_conditions->len;
+	if (!di->match_array)
+		di->match_array = g_array_sized_new(FALSE, TRUE,
+				sizeof(uint8_t), num_conditions);
+	g_array_set_size(di->match_array, num_conditions);
+	if (num_conditions)
+		memset(di->match_array->data, 0, num_conditions);
+	if (!have_terms)
+		g_array_set_size(di->match_array, 0);
+	di->conditions_compiled = TRUE;
+
+	return have_terms;
 }
 
-static void update_old_pins_array(struct srd_decoder_inst *di,
+static void extract_current_pins(struct srd_decoder_inst *di,
 		const uint8_t *sample_pos)
 {
-	uint8_t sample;
-	int i, byte_offset, bit_offset;
+	const int *byte_offsets;
+	const int *mapped_channels;
+	const uint8_t *bit_masks;
+	uint8_t *current_pins;
+	guint i;
+	int channel;
 
-	if (!di || !di->dec_channelmap || !sample_pos)
+	byte_offsets = (const int *)di->channel_byte_offsets->data;
+	bit_masks = (const uint8_t *)di->channel_bit_masks->data;
+	current_pins = (uint8_t *)di->current_pins_array->data;
+	mapped_channels = (const int *)di->mapped_channels->data;
+
+	if (di->all_channels_mapped) {
+		for (i = 0; i < (guint)di->dec_num_channels; i++)
+			current_pins[i] = sample_pos[byte_offsets[i]] & bit_masks[i] ? 1 : 0;
 		return;
+	}
 
-	oldpins_array_seed(di);
-	for (i = 0; i < di->dec_num_channels; i++) {
-		if (di->dec_channelmap[i] == -1)
-			continue; /* Ignore unused optional channels. */
-		byte_offset = di->dec_channelmap[i] / 8;
-		bit_offset = di->dec_channelmap[i] % 8;
-		sample = *(sample_pos + byte_offset) & (1 << bit_offset) ? 1 : 0;
-		di->old_pins_array->data[i] = sample;
+	for (i = 0; i < di->mapped_channels->len; i++) {
+		channel = mapped_channels[i];
+		current_pins[channel] = sample_pos[byte_offsets[channel]] &
+				bit_masks[channel] ? 1 : 0;
+	}
+}
+
+static void update_old_pins_array(struct srd_decoder_inst *di)
+{
+	const uint8_t *current_pins;
+	const int *mapped_channels;
+	uint8_t *old_pins;
+	guint i;
+	int channel;
+
+	current_pins = (const uint8_t *)di->current_pins_array->data;
+	old_pins = (uint8_t *)di->old_pins_array->data;
+	if (di->all_channels_mapped) {
+		memcpy(old_pins, current_pins, di->dec_num_channels);
+		return;
+	}
+
+	mapped_channels = (const int *)di->mapped_channels->data;
+	for (i = 0; i < di->mapped_channels->len; i++) {
+		channel = mapped_channels[i];
+		old_pins[channel] = current_pins[channel];
 	}
 }
 
 static void update_old_pins_array_initial_pins(struct srd_decoder_inst *di)
 {
-	uint8_t sample;
-	int i, byte_offset, bit_offset;
-	const uint8_t *sample_pos;
+	const uint8_t *current_pins;
+	uint8_t *old_pins;
+	int i;
 
-	if (!di || !di->dec_channelmap)
-		return;
-
-	sample_pos = di->inbuf + ((di->abs_cur_samplenum - di->abs_start_samplenum) * di->data_unitsize);
-
-	oldpins_array_seed(di);
+	current_pins = (const uint8_t *)di->current_pins_array->data;
+	old_pins = (uint8_t *)di->old_pins_array->data;
 	for (i = 0; i < di->dec_num_channels; i++) {
-		if (di->old_pins_array->data[i] != SRD_INITIAL_PIN_SAME_AS_SAMPLE0)
+		if (old_pins[i] != SRD_INITIAL_PIN_SAME_AS_SAMPLE0)
 			continue;
 		if (di->dec_channelmap[i] == -1)
-			continue; /* Ignore unused optional channels. */
-		byte_offset = di->dec_channelmap[i] / 8;
-		bit_offset = di->dec_channelmap[i] % 8;
-		sample = *(sample_pos + byte_offset) & (1 << bit_offset) ? 1 : 0;
-		di->old_pins_array->data[i] = sample;
+			continue;
+		old_pins[i] = current_pins[i];
 	}
 }
 
-static gboolean term_matches(const struct srd_decoder_inst *di,
-		struct srd_term *term, const uint8_t *sample_pos)
+static inline gboolean compiled_condition_matches(struct srd_decoder_inst *di,
+		const struct srd_compiled_condition *cond)
 {
+	struct srd_term *term, *terms;
+	const uint8_t *current_pins, *old_pins;
 	uint8_t old_sample, sample;
-	int byte_offset, bit_offset, ch;
+	guint i;
 
-	/* Caller ensures di, di->dec_channelmap, term, sample_pos != NULL. */
-
-	if (term->type == SRD_TERM_SKIP)
-		return sample_matches(0, 0, term);
-
-	ch = term->channel;
-	byte_offset = di->dec_channelmap[ch] / 8;
-	bit_offset = di->dec_channelmap[ch] % 8;
-	sample = *(sample_pos + byte_offset) & (1 << bit_offset) ? 1 : 0;
-	old_sample = di->old_pins_array->data[ch];
-
-	return sample_matches(old_sample, sample, term);
-}
-
-static gboolean all_terms_match(const struct srd_decoder_inst *di,
-		const GSList *cond, const uint8_t *sample_pos)
-{
-	const GSList *l;
-	struct srd_term *term;
-
-	/* Caller ensures di, cond, sample_pos != NULL. */
-
-	for (l = cond; l; l = l->next) {
-		term = l->data;
+	terms = (struct srd_term *)di->compiled_terms->data;
+	current_pins = (const uint8_t *)di->current_pins_array->data;
+	old_pins = (const uint8_t *)di->old_pins_array->data;
+	for (i = 0; i < cond->num_terms; i++) {
+		term = &terms[cond->first_term + i];
 		if (term->type == SRD_TERM_ALWAYS_FALSE)
 			return FALSE;
-		if (!term_matches(di, term, sample_pos))
+		if (term->type == SRD_TERM_SKIP) {
+			if (!sample_matches(0, 0, term))
+				return FALSE;
+			continue;
+		}
+		old_sample = old_pins[term->channel];
+		sample = current_pins[term->channel];
+		if (!sample_matches(old_sample, sample, term))
 			return FALSE;
 	}
 
 	return TRUE;
 }
 
-static gboolean at_least_one_condition_matched(
-		const struct srd_decoder_inst *di, unsigned int num_conditions)
-{
-	unsigned int i;
-
-	/* Caller ensures di != NULL. */
-
-	for (i = 0; i < num_conditions; i++) {
-		if (di->match_array->data[i])
-			return TRUE;
-	}
-
-	return FALSE;
-}
-
 static gboolean find_match(struct srd_decoder_inst *di)
 {
-	uint64_t i, j, num_samples_to_process;
-	GSList *l, *cond;
+	uint64_t i, num_samples_to_process;
+	struct srd_compiled_condition *cond;
 	const uint8_t *sample_pos;
-	unsigned int num_conditions;
+	gboolean any_condition_matched, have_terms;
+	guint j, num_conditions;
 
 	/* Caller ensures di != NULL. */
 
 	/* Check whether the condition list is NULL/empty. */
 	if (!di->condition_list) {
 		srd_dbg("NULL/empty condition list, automatic match.");
+		if (di->abs_cur_samplenum < di->abs_end_samplenum) {
+			sample_pos = di->inbuf + ((di->abs_cur_samplenum -
+					di->abs_start_samplenum) * di->data_unitsize);
+			extract_current_pins(di, sample_pos);
+		}
 		return TRUE;
 	}
 
+	have_terms = TRUE;
+	if (!di->conditions_compiled)
+		have_terms = compile_conditions(di);
+	else if (!di->compiled_terms->len)
+		have_terms = FALSE;
+
 	/* Check whether we have any non-NULL conditions. */
-	if (!have_non_null_conds(di)) {
+	if (!have_terms) {
 		srd_dbg("Only NULL conditions in list, automatic match.");
+		if (di->abs_cur_samplenum < di->abs_end_samplenum) {
+			sample_pos = di->inbuf + ((di->abs_cur_samplenum -
+					di->abs_start_samplenum) * di->data_unitsize);
+			extract_current_pins(di, sample_pos);
+		}
 		return TRUE;
 	}
 
 	num_samples_to_process = di->abs_end_samplenum - di->abs_cur_samplenum;
-	num_conditions = g_slist_length(di->condition_list);
-
-	/* di->match_array is NULL here. Create a new GArray. */
-	di->match_array = g_array_sized_new(FALSE, TRUE, sizeof(gboolean), num_conditions);
-	g_array_set_size(di->match_array, num_conditions);
-
-	/* Sample 0: Set di->old_pins_array for SRD_INITIAL_PIN_SAME_AS_SAMPLE0 pins. */
-	if (di->abs_cur_samplenum == 0)
-		update_old_pins_array_initial_pins(di);
+	num_conditions = di->compiled_conditions->len;
+	oldpins_array_seed(di);
 
 	for (i = 0; i < num_samples_to_process; i++, (di->abs_cur_samplenum)++) {
 
 		sample_pos = di->inbuf + ((di->abs_cur_samplenum - di->abs_start_samplenum) * di->data_unitsize);
 
+		extract_current_pins(di, sample_pos);
+		if (di->abs_cur_samplenum == 0)
+			update_old_pins_array_initial_pins(di);
+
 		/* Check whether the current sample matches at least one of the conditions (logical OR). */
 		/* IMPORTANT: We need to check all conditions, even if there was a match already! */
-		for (l = di->condition_list, j = 0; l; l = l->next, j++) {
-			cond = l->data;
-			if (!cond)
+		any_condition_matched = FALSE;
+		for (j = 0; j < num_conditions; j++) {
+			cond = &g_array_index(di->compiled_conditions,
+					struct srd_compiled_condition, j);
+			if (!cond->num_terms) {
+				di->match_array->data[j] = FALSE;
 				continue;
-			/* All terms in 'cond' must match (logical AND). */
-			di->match_array->data[j] = all_terms_match(di, cond, sample_pos);
+			}
+			di->match_array->data[j] = compiled_condition_matches(di, cond);
+			any_condition_matched |= di->match_array->data[j];
 		}
 
-		update_old_pins_array(di, sample_pos);
+		update_old_pins_array(di);
 
 		/* If at least one condition matched we're done. */
-		if (at_least_one_condition_matched(di, num_conditions))
+		if (any_condition_matched)
 			return TRUE;
 	}
 
@@ -1434,6 +1554,7 @@ SRD_PRIV void srd_inst_free(struct srd_decoder_inst *di)
 	PyGILState_Release(gstate);
 
 	g_free(di->inst_id);
+	matching_working_storage_free(di);
 	g_free(di->dec_channelmap);
 	g_free(di->channel_samples);
 	g_slist_free(di->next_di);

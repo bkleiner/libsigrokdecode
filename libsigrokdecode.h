@@ -265,6 +265,18 @@ struct srd_decoder_inst {
 	/** Array of booleans denoting which conditions matched. */
 	GArray *match_array;
 
+	/** Compiled conditions and terms used by the sample matching loop. */
+	GArray *compiled_conditions;
+	GArray *compiled_terms;
+	gboolean conditions_compiled;
+
+	/** Cached channel extraction data and current decoder pin values. */
+	GArray *channel_byte_offsets;
+	GArray *channel_bit_masks;
+	GArray *current_pins_array;
+	GArray *mapped_channels;
+	gboolean all_channels_mapped;
+
 	/** Absolute start sample number. */
 	uint64_t abs_start_samplenum;
 

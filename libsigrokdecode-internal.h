@@ -56,6 +56,11 @@ struct srd_term {
 	uint64_t num_samples_already_skipped;
 };
 
+struct srd_compiled_condition {
+	guint first_term;
+	guint num_terms;
+};
+
 /* Custom Python types: */
 
 typedef struct {

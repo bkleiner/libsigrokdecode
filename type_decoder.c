@@ -702,8 +702,6 @@ static PyObject *get_current_pinvalues(const struct srd_decoder_inst *di)
 {
 	int i;
 	uint8_t sample;
-	const uint8_t *sample_pos;
-	int byte_offset, bit_offset;
 	PyObject *py_pinvalues;
 	PyGILState_STATE gstate;
 
@@ -717,17 +715,8 @@ static PyObject *get_current_pinvalues(const struct srd_decoder_inst *di)
 	py_pinvalues = PyTuple_New(di->dec_num_channels);
 
 	for (i = 0; i < di->dec_num_channels; i++) {
-		/* A channelmap value of -1 means "unused optional channel". */
-		if (di->dec_channelmap[i] == -1) {
-			/* Value of unused channel is 0xff, instead of 0 or 1. */
-			PyTuple_SetItem(py_pinvalues, i, PyLong_FromUnsignedLong(0xff));
-		} else {
-			sample_pos = di->inbuf + ((di->abs_cur_samplenum - di->abs_start_samplenum) * di->data_unitsize);
-			byte_offset = di->dec_channelmap[i] / 8;
-			bit_offset = di->dec_channelmap[i] % 8;
-			sample = *(sample_pos + byte_offset) & (1 << bit_offset) ? 1 : 0;
-			PyTuple_SetItem(py_pinvalues, i, PyLong_FromUnsignedLong(sample));
-		}
+		sample = g_array_index(di->current_pins_array, uint8_t, i);
+		PyTuple_SetItem(py_pinvalues, i, PyLong_FromUnsignedLong(sample));
 	}
 
 	PyGILState_Release(gstate);
@@ -775,7 +764,7 @@ static int create_term_list(struct srd_decoder_inst *di,
 				srd_err("Failed to get the value.");
 				goto err;
 			}
-			term = g_malloc(sizeof(struct srd_term));
+			term = g_malloc0(sizeof(struct srd_term));
 			term->type = get_term_type(term_str);
 			term->channel = PyLong_AsLong(py_key);
 			if (term->channel < 0 || term->channel >= di->dec_num_channels)
@@ -788,7 +777,7 @@ static int create_term_list(struct srd_decoder_inst *di,
 				srd_err("Failed to get number of samples to skip.");
 				goto err;
 			}
-			term = g_malloc(sizeof(struct srd_term));
+			term = g_malloc0(sizeof(struct srd_term));
 			term->type = SRD_TERM_SKIP;
 			term->num_samples_to_skip = num_samples_to_skip;
 			term->num_samples_already_skipped = 0;
@@ -953,7 +942,7 @@ static int set_skip_condition(struct srd_decoder_inst *di, uint64_t count)
 	GSList *term_list;
 
 	condition_list_free(di);
-	term = g_malloc(sizeof(*term));
+	term = g_malloc0(sizeof(*term));
 	term->type = SRD_TERM_SKIP;
 	term->num_samples_to_skip = count;
 	term->num_samples_already_skipped = 0;

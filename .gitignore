@@ -37,3 +37,12 @@ stamp-h?
 /tests/*.log
 /tests/*.trs
 /tests/main
+
+# makepkg artifacts
+/contrib/libsigrokdecode/
+/contrib/src/
+/contrib/pkg/
+/contrib/*.pkg.tar.*
+/contrib/*.src.tar.*
+/contrib/*.log
+/contrib/*.sig

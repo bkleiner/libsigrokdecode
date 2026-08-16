@@ -22,8 +22,39 @@
 #include <libsigrokdecode.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <check.h>
 #include "lib.h"
+
+struct match_result {
+	uint64_t sample;
+	char *matched;
+};
+
+static void match_output_callback(struct srd_proto_data *pdata, void *cb_data)
+{
+	GArray *results;
+	struct match_result result;
+	struct srd_proto_data_annotation *annotation;
+
+	results = cb_data;
+	annotation = pdata->data;
+	result.sample = pdata->start_sample;
+	result.matched = g_strdup(annotation->ann_text[0]);
+	g_array_append_val(results, result);
+}
+
+static void match_results_clear(GArray *results)
+{
+	struct match_result *result;
+	guint i;
+
+	for (i = 0; i < results->len; i++) {
+		result = &g_array_index(results, struct match_result, i);
+		g_free(result->matched);
+	}
+	g_array_free(results, TRUE);
+}
 
 /*
  * Check whether srd_session_new() works.
@@ -260,6 +291,67 @@ START_TEST(test_session_reset_nodata)
 }
 END_TEST
 
+START_TEST(test_wait_match_semantics)
+{
+	static const uint8_t samples[] = { 0x00, 0x00, 0x01, 0x01, 0x03, 0x03 };
+	static const uint64_t expected_samples[] = { 2, 4, 4, 5 };
+	static const char *expected_matches[] = { "11", "1", "1", "01" };
+	struct srd_decoder_inst *inst;
+	struct srd_session *sess;
+	struct match_result *result;
+	GHashTable *channels;
+	GArray *results;
+	guint i;
+	int ret;
+
+	srd_init(TEST_DECODERS_DIR);
+	ret = srd_decoder_load("wait_match");
+	fail_unless(ret == SRD_OK, "Failed to load wait_match decoder: %d.", ret);
+	srd_session_new(&sess);
+	inst = srd_inst_new(sess, "wait_match", NULL);
+	fail_unless(inst != NULL, "Failed to create wait_match instance.");
+
+	channels = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+			(GDestroyNotify)g_variant_unref);
+	g_hash_table_insert(channels, g_strdup("a"), g_variant_ref_sink(g_variant_new_int32(0)));
+	g_hash_table_insert(channels, g_strdup("b"), g_variant_ref_sink(g_variant_new_int32(1)));
+	ret = srd_inst_channel_set_all(inst, channels);
+	g_hash_table_destroy(channels);
+	fail_unless(ret == SRD_OK, "Failed to set wait_match channels: %d.", ret);
+
+	results = g_array_new(FALSE, FALSE, sizeof(struct match_result));
+	srd_pd_output_callback_add(sess, SRD_OUTPUT_ANN, match_output_callback, results);
+	ret = srd_session_start(sess);
+	fail_unless(ret == SRD_OK, "Failed to start wait_match session: %d.", ret);
+
+	/* Split immediately before the first match to exercise chunk continuity. */
+	ret = srd_session_send(sess, 0, 2, samples, 2, 1);
+	fail_unless(ret == SRD_OK, "Failed to send first sample chunk: %d.", ret);
+	ret = srd_session_send(sess, 2, G_N_ELEMENTS(samples), samples + 2,
+			G_N_ELEMENTS(samples) - 2, 1);
+	fail_unless(ret == SRD_OK, "Failed to send second sample chunk: %d.", ret);
+	ret = srd_session_send_eof(sess);
+	fail_unless(ret == SRD_OK, "Failed to send EOF: %d.", ret);
+
+	fail_unless(results->len == G_N_ELEMENTS(expected_samples),
+			"Expected %u matches, got %u.",
+			(unsigned int)G_N_ELEMENTS(expected_samples), results->len);
+	for (i = 0; i < results->len; i++) {
+		result = &g_array_index(results, struct match_result, i);
+		fail_unless(result->sample == expected_samples[i],
+				"Match %u occurred at sample %" PRIu64 ", expected %" PRIu64 ".",
+				i, result->sample, expected_samples[i]);
+		fail_unless(!strcmp(result->matched, expected_matches[i]),
+				"Match %u was %s, expected %s.", i,
+				result->matched, expected_matches[i]);
+	}
+
+	match_results_clear(results);
+	srd_session_destroy(sess);
+	srd_exit();
+}
+END_TEST
+
 Suite *suite_session(void)
 {
 	Suite *s;
@@ -284,6 +376,11 @@ Suite *suite_session(void)
 
 	tc = tcase_create("reset");
 	tcase_add_test(tc, test_session_reset_nodata);
+	suite_add_tcase(s, tc);
+
+	tc = tcase_create("wait_match");
+	tcase_add_checked_fixture(tc, srdtest_setup, srdtest_teardown);
+	tcase_add_test(tc, test_wait_match_semantics);
 	suite_add_tcase(s, tc);
 
 	return s;
