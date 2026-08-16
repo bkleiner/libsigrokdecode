@@ -30,23 +30,37 @@ class Decoder(srd.Decoder):
     def start(self):
         self.out_ann = self.register(srd.OUTPUT_ANN)
 
-    def report(self):
-        matched = ''.join('1' if value else '0' for value in self.matched)
+    def report(self, pins):
+        matched = ('none' if self.matched is None else
+                   ''.join('1' if value else '0' for value in self.matched))
+        pinvalues = ','.join(str(value) for value in pins)
         self.put(self.samplenum, self.samplenum, self.out_ann,
-                 [0, [matched]])
+                 [0, [f'{matched}/{pinvalues}']])
 
     def decode(self):
-        self.wait([{0: 'r'}, {'skip': 2}])
-        self.report()
+        pins = self.wait()
+        self.report(pins)
 
-        self.wait({1: 'r'})
-        self.report()
+        pins = self.wait()
+        self.report(pins)
 
-        self.wait({0: 'h', 1: 'h'})
-        self.report()
+        pins = self.wait([{0: 'r'}, {'skip': 2}])
+        self.report(pins)
 
-        self.wait([{2: 'h'}, {'skip': 1}])
-        self.report()
+        pins = self.wait({1: 'r'})
+        self.report(pins)
+
+        pins = self.wait({0: 'h', 1: 'h'})
+        self.report(pins)
+
+        pins = self.wait([{2: 'h'}, {'skip': 1}])
+        self.report(pins)
+
+        pins = self.wait({'skip': 2})
+        self.report(pins)
+
+        pins = self.wait([{}])
+        self.report(pins)
 
         while True:
             self.wait()

@@ -293,9 +293,14 @@ END_TEST
 
 START_TEST(test_wait_match_semantics)
 {
-	static const uint8_t samples[] = { 0x00, 0x00, 0x01, 0x01, 0x03, 0x03 };
-	static const uint64_t expected_samples[] = { 2, 4, 4, 5 };
-	static const char *expected_matches[] = { "11", "1", "1", "01" };
+	static const uint8_t samples[] = {
+		0x00, 0x00, 0x01, 0x01, 0x03, 0x03, 0x03, 0x03,
+	};
+	static const uint64_t expected_samples[] = { 0, 1, 2, 4, 4, 5, 7, 7 };
+	static const char *expected_matches[] = {
+		"1/0,0,255", "1/0,0,255", "10/1,0,255", "1/1,1,255",
+		"1/1,1,255", "01/1,1,255", "1/1,1,255", "none/1,1,255",
+	};
 	struct srd_decoder_inst *inst;
 	struct srd_session *sess;
 	struct match_result *result;
@@ -327,9 +332,11 @@ START_TEST(test_wait_match_semantics)
 	/* Split immediately before the first match to exercise chunk continuity. */
 	ret = srd_session_send(sess, 0, 2, samples, 2, 1);
 	fail_unless(ret == SRD_OK, "Failed to send first sample chunk: %d.", ret);
-	ret = srd_session_send(sess, 2, G_N_ELEMENTS(samples), samples + 2,
-			G_N_ELEMENTS(samples) - 2, 1);
+	ret = srd_session_send(sess, 2, 7, samples + 2, 5, 1);
 	fail_unless(ret == SRD_OK, "Failed to send second sample chunk: %d.", ret);
+	ret = srd_session_send(sess, 7, G_N_ELEMENTS(samples), samples + 7,
+			G_N_ELEMENTS(samples) - 7, 1);
+	fail_unless(ret == SRD_OK, "Failed to send third sample chunk: %d.", ret);
 	ret = srd_session_send_eof(sess);
 	fail_unless(ret == SRD_OK, "Failed to send EOF: %d.", ret);
 

@@ -270,10 +270,9 @@ struct srd_decoder_inst {
 	GArray *compiled_terms;
 	gboolean conditions_compiled;
 
-	/** Cached channel extraction data and current decoder pin values. */
+	/** Cached channel extraction data. */
 	GArray *channel_byte_offsets;
 	GArray *channel_bit_masks;
-	GArray *current_pins_array;
 	GArray *mapped_channels;
 	gboolean all_channels_mapped;
 

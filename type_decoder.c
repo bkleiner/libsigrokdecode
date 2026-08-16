@@ -715,7 +715,10 @@ static PyObject *get_current_pinvalues(const struct srd_decoder_inst *di)
 	py_pinvalues = PyTuple_New(di->dec_num_channels);
 
 	for (i = 0; i < di->dec_num_channels; i++) {
-		sample = g_array_index(di->current_pins_array, uint8_t, i);
+		if (di->dec_channelmap[i] == -1)
+			sample = 0xff;
+		else
+			sample = g_array_index(di->old_pins_array, uint8_t, i);
 		PyTuple_SetItem(py_pinvalues, i, PyLong_FromUnsignedLong(sample));
 	}
 
@@ -725,37 +728,34 @@ static PyObject *get_current_pinvalues(const struct srd_decoder_inst *di)
 }
 
 /**
- * Create a list of terms in the specified condition.
- *
- * If there are no terms in the condition, 'term_list' will be NULL.
+ * Compile the terms in the specified condition.
  *
  * @param di The decoder instance to use. Must not be NULL.
  * @param py_dict A Python dict containing terms. Must not be NULL.
- * @param term_list Pointer to a GSList which will be set to the newly
- *                  created list of terms. Must not be NULL.
  *
  * @return SRD_OK upon success, a negative error code otherwise.
  */
-static int create_term_list(struct srd_decoder_inst *di,
-	PyObject *py_dict, GSList **term_list)
+static int compile_condition(struct srd_decoder_inst *di, PyObject *py_dict)
 {
 	Py_ssize_t pos = 0;
 	PyObject *py_key, *py_value;
-	struct srd_term *term;
+	struct srd_compiled_condition condition;
+	struct srd_term term;
 	int64_t num_samples_to_skip;
 	char *term_str;
 	PyGILState_STATE gstate;
 
-	if (!py_dict || !term_list)
+	if (!di || !py_dict)
 		return SRD_ERR_ARG;
 
-	/* "Create" an empty GSList of terms. */
-	*term_list = NULL;
+	condition.first_term = di->compiled_terms->len;
+	condition.num_terms = 0;
 
 	gstate = PyGILState_Ensure();
 
 	/* Iterate over all items in the current dict. */
 	while (PyDict_Next(py_dict, &pos, &py_key, &py_value)) {
+		memset(&term, 0, sizeof(term));
 		/* Check whether the current key is a string or a number. */
 		if (PyLong_Check(py_key)) {
 			/* The key is a number. */
@@ -764,11 +764,12 @@ static int create_term_list(struct srd_decoder_inst *di,
 				srd_err("Failed to get the value.");
 				goto err;
 			}
-			term = g_malloc0(sizeof(struct srd_term));
-			term->type = get_term_type(term_str);
-			term->channel = PyLong_AsLong(py_key);
-			if (term->channel < 0 || term->channel >= di->dec_num_channels)
-				term->type = SRD_TERM_ALWAYS_FALSE;
+			term.type = get_term_type(term_str);
+			term.channel = PyLong_AsLong(py_key);
+			if (term.channel < 0 || term.channel >= di->dec_num_channels ||
+					(term.type != SRD_TERM_ALWAYS_FALSE &&
+					di->dec_channelmap[term.channel] == -1))
+				term.type = SRD_TERM_ALWAYS_FALSE;
 			g_free(term_str);
 		} else if (PyUnicode_Check(py_key)) {
 			/* The key is a string. */
@@ -777,26 +778,26 @@ static int create_term_list(struct srd_decoder_inst *di,
 				srd_err("Failed to get number of samples to skip.");
 				goto err;
 			}
-			term = g_malloc0(sizeof(struct srd_term));
-			term->type = SRD_TERM_SKIP;
-			term->num_samples_to_skip = num_samples_to_skip;
-			term->num_samples_already_skipped = 0;
+			term.type = SRD_TERM_SKIP;
+			term.num_samples_to_skip = num_samples_to_skip;
 			if (num_samples_to_skip < 0)
-				term->type = SRD_TERM_ALWAYS_FALSE;
+				term.type = SRD_TERM_ALWAYS_FALSE;
 		} else {
 			srd_err("Term key is neither a string nor a number.");
 			goto err;
 		}
 
-		/* Add the term to the list of terms. */
-		*term_list = g_slist_append(*term_list, term);
+		g_array_append_val(di->compiled_terms, term);
+		condition.num_terms++;
 	}
+	g_array_append_val(di->compiled_conditions, condition);
 
 	PyGILState_Release(gstate);
 
 	return SRD_OK;
 
 err:
+	g_array_set_size(di->compiled_terms, condition.first_term);
 	PyGILState_Release(gstate);
 
 	return SRD_ERR;
@@ -816,7 +817,6 @@ err:
 static int set_new_condition_list(PyObject *self, PyObject *args)
 {
 	struct srd_decoder_inst *di;
-	GSList *term_list;
 	PyObject *py_conditionlist, *py_conds, *py_dict;
 	int i, num_conditions, ret;
 	PyGILState_STATE gstate;
@@ -879,6 +879,12 @@ static int set_new_condition_list(PyObject *self, PyObject *args)
 
 	/* Free the old condition list. */
 	condition_list_free(di);
+	if (!di->compiled_conditions)
+		di->compiled_conditions = g_array_new(FALSE, FALSE,
+				sizeof(struct srd_compiled_condition));
+	if (!di->compiled_terms)
+		di->compiled_terms = g_array_new(FALSE, FALSE,
+				sizeof(struct srd_term));
 
 	ret = SRD_OK;
 
@@ -892,12 +898,19 @@ static int set_new_condition_list(PyObject *self, PyObject *args)
 			break;
 		}
 
-		/* Create the list of terms in this condition. */
-		if ((ret = create_term_list(di, py_dict, &term_list)) < 0)
+		/* Compile the terms in this condition. */
+		if ((ret = compile_condition(di, py_dict)) < 0)
 			break;
-
-		/* Add the new condition to the PD instance's condition list. */
-		di->condition_list = g_slist_append(di->condition_list, term_list);
+	}
+	if (ret == SRD_OK) {
+		if (!di->match_array)
+			di->match_array = g_array_sized_new(FALSE, FALSE,
+					sizeof(uint8_t), num_conditions);
+		g_array_set_size(di->match_array,
+				di->compiled_terms->len ? num_conditions : 0);
+		di->conditions_compiled = TRUE;
+	} else {
+		condition_list_free(di);
 	}
 
 	Py_DecRef(py_conditionlist);
@@ -918,7 +931,7 @@ ret_9999:
 }
 
 /**
- * Create a SKIP condition list for condition-less .wait() calls.
+ * Create a compiled SKIP condition for condition-less .wait() calls.
  *
  * @param di Decoder instance.
  * @param count Number of samples to skip.
@@ -938,16 +951,27 @@ ret_9999:
  */
 static int set_skip_condition(struct srd_decoder_inst *di, uint64_t count)
 {
-	struct srd_term *term;
-	GSList *term_list;
+	struct srd_compiled_condition condition;
+	struct srd_term term;
 
 	condition_list_free(di);
-	term = g_malloc0(sizeof(*term));
-	term->type = SRD_TERM_SKIP;
-	term->num_samples_to_skip = count;
-	term->num_samples_already_skipped = 0;
-	term_list = g_slist_append(NULL, term);
-	di->condition_list = g_slist_append(di->condition_list, term_list);
+	if (!di->compiled_conditions)
+		di->compiled_conditions = g_array_new(FALSE, FALSE,
+				sizeof(struct srd_compiled_condition));
+	if (!di->compiled_terms)
+		di->compiled_terms = g_array_new(FALSE, FALSE,
+				sizeof(struct srd_term));
+	memset(&term, 0, sizeof(term));
+	term.type = SRD_TERM_SKIP;
+	term.num_samples_to_skip = count;
+	condition.first_term = 0;
+	condition.num_terms = 1;
+	g_array_append_val(di->compiled_terms, term);
+	g_array_append_val(di->compiled_conditions, condition);
+	if (!di->match_array)
+		di->match_array = g_array_sized_new(FALSE, FALSE, sizeof(uint8_t), 1);
+	g_array_set_size(di->match_array, 1);
+	di->conditions_compiled = TRUE;
 
 	return SRD_OK;
 }
@@ -1005,7 +1029,7 @@ static PyObject *Decoder_wait(PyObject *self, PyObject *args)
 		 */
 		if (di->abs_cur_samplenum)
 			skip_count = 1;
-		else if (!di->condition_list)
+		else if (!di->conditions_compiled)
 			skip_count = 0;
 		else
 			skip_count = 1;
