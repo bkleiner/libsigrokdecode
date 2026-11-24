@@ -497,8 +497,13 @@ SRD_API struct srd_decoder_inst *srd_inst_new(struct srd_session *sess,
 	g_cond_init(&di->handled_all_samples_cond);
 	g_mutex_init(&di->data_mutex);
 
-	/* Instance takes input from a frontend by default. */
+	/*
+	 * Instance takes input from a frontend by default. Decoder threads
+	 * of other sessions walk the instance lists with the GIL held.
+	 */
+	gstate = PyGILState_Ensure();
 	sess->di_list = g_slist_append(sess->di_list, di);
+	PyGILState_Release(gstate);
 	srd_dbg("Creating new %s instance %s.", decoder_id, di->inst_id);
 
 	return di;
@@ -580,6 +585,8 @@ SRD_API int srd_inst_stack(struct srd_session *sess,
 		struct srd_decoder_inst *di_bottom,
 		struct srd_decoder_inst *di_top)
 {
+	PyGILState_STATE gstate;
+
 	if (!sess)
 		return SRD_ERR_ARG;
 
@@ -588,10 +595,12 @@ SRD_API int srd_inst_stack(struct srd_session *sess,
 		return SRD_ERR_ARG;
 	}
 
+	gstate = PyGILState_Ensure();
 	if (g_slist_find(sess->di_list, di_top)) {
 		/* Remove from the unstacked list. */
 		sess->di_list = g_slist_remove(sess->di_list, di_top);
 	}
+	PyGILState_Release(gstate);
 
 	/*
 	 * Check if there's at least one matching input/output pair
@@ -615,7 +624,9 @@ SRD_API int srd_inst_stack(struct srd_session *sess,
 			di_top->inst_id, di_bottom->inst_id);
 
 	/* Stack on top of source di. */
+	gstate = PyGILState_Ensure();
 	di_bottom->next_di = g_slist_append(di_bottom->next_di, di_top);
+	PyGILState_Release(gstate);
 
 	srd_dbg("Stacking %s onto %s.", di_top->inst_id, di_bottom->inst_id);
 
@@ -1574,10 +1585,29 @@ SRD_PRIV void srd_inst_free(struct srd_decoder_inst *di)
 /** @private */
 SRD_PRIV void srd_inst_free_all(struct srd_session *sess)
 {
+	GSList *l, *di_list;
+	PyGILState_STATE gstate;
+
 	if (!sess)
 		return;
 
-	g_slist_free_full(sess->di_list, (GDestroyNotify)srd_inst_free);
+	/*
+	 * Stop the decoder threads while the instances are still listed,
+	 * they look themselves up in the session list on every put()/wait().
+	 */
+	for (l = sess->di_list; l; l = l->next)
+		srd_inst_join_decode_thread(l->data);
+
+	/*
+	 * Unlink the instances before freeing them, decoder threads of
+	 * other sessions walk all instance lists with the GIL held.
+	 */
+	gstate = PyGILState_Ensure();
+	di_list = sess->di_list;
+	sess->di_list = NULL;
+	PyGILState_Release(gstate);
+
+	g_slist_free_full(di_list, (GDestroyNotify)srd_inst_free);
 }
 
 /** @} */

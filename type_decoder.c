@@ -334,11 +334,16 @@ static inline struct srd_decoder_inst *srd_inst_find_by_obj(
 	struct srd_session *sess;
 	GSList *l;
 
+	if (!sessions)
+		return NULL;
+
 	/* Performance shortcut: Handle the most common case first. */
 	sess = sessions->data;
-	di = sess->di_list->data;
-	if (di->py_inst == obj)
-		return di;
+	if (sess->di_list) {
+		di = sess->di_list->data;
+		if (di->py_inst == obj)
+			return di;
+	}
 
 	di = NULL;
 	for (l = sessions; di == NULL && l != NULL; l = l->next) {

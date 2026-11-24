@@ -60,6 +60,8 @@ SRD_PRIV int max_session_id = -1;
  */
 SRD_API int srd_session_new(struct srd_session **sess)
 {
+	PyGILState_STATE gstate;
+
 	if (!sess)
 		return SRD_ERR_ARG;
 
@@ -67,8 +69,14 @@ SRD_API int srd_session_new(struct srd_session **sess)
 	(*sess)->session_id = ++max_session_id;
 	(*sess)->di_list = (*sess)->callbacks = NULL;
 
-	/* Keep a list of all sessions, so we can clean up as needed. */
+	/*
+	 * Keep a list of all sessions, so we can clean up as needed.
+	 * Decoder threads of other sessions walk this list with the GIL
+	 * held, so it must only be modified with the GIL held.
+	 */
+	gstate = PyGILState_Ensure();
 	sessions = g_slist_append(sessions, *sess);
+	PyGILState_Release(gstate);
 
 	srd_dbg("Creating session %d.", (*sess)->session_id);
 
@@ -357,6 +365,7 @@ SRD_API int srd_session_terminate_reset(struct srd_session *sess)
 SRD_API int srd_session_destroy(struct srd_session *sess)
 {
 	int session_id;
+	PyGILState_STATE gstate;
 
 	if (!sess)
 		return SRD_ERR_ARG;
@@ -364,9 +373,14 @@ SRD_API int srd_session_destroy(struct srd_session *sess)
 	session_id = sess->session_id;
 	if (sess->di_list)
 		srd_inst_free_all(sess);
+
+	/* See srd_session_new(): other sessions' threads walk this list. */
+	gstate = PyGILState_Ensure();
+	sessions = g_slist_remove(sessions, sess);
+	PyGILState_Release(gstate);
+
 	if (sess->callbacks)
 		g_slist_free_full(sess->callbacks, g_free);
-	sessions = g_slist_remove(sessions, sess);
 	g_free(sess);
 
 	srd_dbg("Destroyed session %d.", session_id);
